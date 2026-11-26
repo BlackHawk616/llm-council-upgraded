@@ -17,7 +17,12 @@ app = FastAPI(title="LLM Council API")
 # Enable CORS for local development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -160,7 +165,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results, aggregate_rankings)
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # Wait for title generation if it was started
@@ -195,5 +200,39 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    from .config import set_runtime_overrides
+
+    parser = argparse.ArgumentParser(description="Run LLM Council backend")
+    parser.add_argument("--config", dest="config_path", help="Path to council_config.json or config.yaml")
+    parser.add_argument("--openai-key", dest="openai_key", help="OpenAI API key override")
+    parser.add_argument("--anthropic-key", dest="anthropic_key", help="Anthropic API key override")
+    parser.add_argument("--google-key", dest="google_key", help="Google API key override")
+    parser.add_argument("--groq-key", dest="groq_key", help="Groq API key override")
+    parser.add_argument("--openrouter-key", dest="openrouter_key", help="OpenRouter API key override")
+    parser.add_argument(
+        "--provider-fallback-to-openrouter",
+        dest="provider_fallback_to_openrouter",
+        choices=["true", "false"],
+        help="Whether direct-provider failures should retry through OpenRouter",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
+    parser.add_argument("--port", type=int, default=8001, help="Bind port")
+
+    args = parser.parse_args()
+    set_runtime_overrides(
+        openai_key=args.openai_key,
+        anthropic_key=args.anthropic_key,
+        google_key=args.google_key,
+        groq_key=args.groq_key,
+        openrouter_key=args.openrouter_key,
+        config_path=args.config_path,
+        provider_fallback_to_openrouter=(
+            None
+            if args.provider_fallback_to_openrouter is None
+            else args.provider_fallback_to_openrouter == "true"
+        ),
+    )
+
+    uvicorn.run(app, host=args.host, port=args.port)

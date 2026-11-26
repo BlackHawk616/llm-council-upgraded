@@ -1,8 +1,63 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+import asyncio
+import logging
+import re
+from typing import List, Dict, Any, Tuple, Optional
+
+from .llm_client import query_model, query_model_routed
+from .config import get_council_models, get_chairman_model, get_model_id
+
+logger = logging.getLogger(__name__)
+
+# Stagger delay (in seconds) between free-tier model requests
+_FREE_TIER_STAGGER_DELAY = 1.5
+
+
+def _get_voting_models() -> List[Dict[str, str]]:
+    """Return council models excluding the chairman for fair voting."""
+    chairman = get_chairman_model()
+    chairman_id = get_model_id(chairman)
+    models = [m for m in get_council_models() if get_model_id(m) != chairman_id]
+    # If config accidentally only includes the chairman, keep original list so
+    # the system remains usable instead of hard-failing.
+    return models or get_council_models()
+
+
+async def _query_models_sequential(
+    models: List[Dict[str, str]],
+    messages: List[Dict[str, str]],
+    *,
+    max_tokens: Optional[int] = None,
+    max_tokens_groq: Optional[int] = None,
+) -> Dict[str, Any | None]:
+    """Query models one-by-one with stagger for free-tier models.
+
+    Args:
+        models: List of model config dicts
+        messages: Chat messages to send
+        max_tokens: Default max_tokens for non-Groq models (None = no limit)
+        max_tokens_groq: Override max_tokens for Groq models (None = use max_tokens)
+    """
+    results: Dict[str, Any | None] = {}
+    for i, model_config in enumerate(models):
+        model_id = get_model_id(model_config)
+        is_free = model_config.get("tier", "free") == "free"
+
+        # Determine max_tokens for this model
+        if model_config.get("provider") == "groq" and max_tokens_groq is not None:
+            mt = max_tokens_groq
+        else:
+            mt = max_tokens
+
+        # Stagger free-tier models (skip delay for the first model)
+        if i > 0 and is_free:
+            await asyncio.sleep(_FREE_TIER_STAGGER_DELAY)
+
+        results[model_id] = await query_model_routed(
+            model_config, messages, max_tokens=mt, timeout=30.0,
+        )
+    return results
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -16,18 +71,32 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
         List of dicts with 'model' and 'response' keys
     """
     messages = [{"role": "user", "content": user_query}]
+    voting_models = _get_voting_models()
 
-    # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Query one-by-one with stagger for better stability on free tiers.
+    # Groq models capped at 1024 tokens for Stage 1.
+    responses = await _query_models_sequential(
+        voting_models, messages, max_tokens_groq=1024,
+    )
 
     # Format results
     stage1_results = []
-    for model, response in responses.items():
+    for model_id, response in responses.items():
         if response is not None:  # Only include successful responses
             stage1_results.append({
-                "model": model,
+                "model": model_id,
                 "response": response.get('content', '')
             })
+
+    # Warn if more than half the council failed
+    total = len(voting_models)
+    succeeded = len(stage1_results)
+    failed = total - succeeded
+    if failed > total / 2:
+        logger.warning(
+            "Stage 1: %d/%d models failed (more than half). Proceeding with %d survivors.",
+            failed, total, succeeded,
+        )
 
     return stage1_results
 
@@ -37,7 +106,9 @@ async def stage2_collect_rankings(
     stage1_results: List[Dict[str, Any]]
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
-    Stage 2: Each model ranks the anonymized responses.
+    Stage 2: Each model ranks ALL anonymized responses.
+    Anonymization (Response A/B/C) is the bias protection — models cannot
+    see whose response is whose, so they evaluate on merit alone.
 
     Args:
         user_query: The original user query
@@ -49,7 +120,7 @@ async def stage2_collect_rankings(
     # Create anonymized labels for responses (Response A, Response B, etc.)
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
-    # Create mapping from label to model name
+    # Create mapping from label to model name (model ID string)
     label_to_model = {
         f"Response {label}": result['model']
         for label, result in zip(labels, stage1_results)
@@ -94,17 +165,38 @@ Now provide your evaluation and ranking:"""
 
     messages = [{"role": "user", "content": ranking_prompt}]
 
-    # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Build model config dicts for the evaluator models
+    # (models that actually produced Stage 1 responses)
+    all_council = get_council_models()
+    council_by_id = {get_model_id(m): m for m in all_council}
+
+    evaluator_configs = []
+    for result in stage1_results:
+        model_id = result["model"]
+        if model_id in council_by_id:
+            evaluator_configs.append(council_by_id[model_id])
+        else:
+            # Fallback: build a minimal config for unknown model IDs
+            evaluator_configs.append({
+                "id": model_id,
+                "provider": "openrouter",
+                "label": model_id,
+                "tier": "free",
+            })
+
+    # Groq models capped at 512 tokens for Stage 2
+    responses = await _query_models_sequential(
+        evaluator_configs, messages, max_tokens_groq=512,
+    )
 
     # Format results
     stage2_results = []
-    for model, response in responses.items():
+    for model_id, response in responses.items():
         if response is not None:
             full_text = response.get('content', '')
             parsed = parse_ranking_from_text(full_text)
             stage2_results.append({
-                "model": model,
+                "model": model_id,
                 "ranking": full_text,
                 "parsed_ranking": parsed
             })
@@ -115,62 +207,135 @@ Now provide your evaluation and ranking:"""
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    aggregate_rankings: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """
-    Stage 3: Chairman synthesizes final response.
+    Stage 3: Chairman synthesizes final response using blind, structured synthesis.
 
     Args:
         user_query: The original user query
         stage1_results: Individual model responses from Stage 1
         stage2_results: Rankings from Stage 2
+        aggregate_rankings: Sorted aggregate ranking data
 
     Returns:
         Dict with 'model' and 'response' keys
     """
-    # Build comprehensive context for chairman
+    # Build fully anonymized Stage 1 context — strip ALL model names
+    labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
+    label_to_model = {
+        f"Response {label}": result['model']
+        for label, result in zip(labels, stage1_results)
+    }
+    model_to_label = {model: label for label, model in label_to_model.items()}
+
     stage1_text = "\n\n".join([
-        f"Model: {result['model']}\nResponse: {result['response']}"
-        for result in stage1_results
+        f"Response {label}:\n{result['response']}"
+        for label, result in zip(labels, stage1_results)
     ])
 
+    # Anonymize Stage 2 evaluations — strip any model names that may appear
     stage2_text = "\n\n".join([
-        f"Model: {result['model']}\nRanking: {result['ranking']}"
-        for result in stage2_results
+        f"Evaluation {idx + 1}:\n{result['ranking']}"
+        for idx, result in enumerate(stage2_results)
     ])
 
-    chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+    # Build aggregate rankings text using ONLY anonymous labels
+    aggregate_text = "No aggregate ranking available."
+    if aggregate_rankings:
+        aggregate_lines = []
+        for item in aggregate_rankings:
+            model = item.get("model")
+            label = model_to_label.get(model, "Unknown")
+            avg_rank = item.get("average_rank")
+            votes = item.get("rankings_count")
+            aggregate_lines.append(
+                f"{label}: average_rank={avg_rank} ({votes} votes) — lower rank number = rated higher by peers"
+            )
+        aggregate_text = "\n".join(aggregate_lines)
+
+    chairman_config = get_chairman_model()
+    chairman_model_id = get_model_id(chairman_config)
+
+    chairman_prompt = f"""You are synthesizing a final answer from multiple anonymous responses to a user's question. You have access to the responses, peer evaluations, and aggregate rankings.
 
 Original Question: {user_query}
 
-STAGE 1 - Individual Responses:
+RESPONSES (anonymous labels only — no model names):
 {stage1_text}
 
-STAGE 2 - Peer Rankings:
+PEER EVALUATIONS (anonymous):
 {stage2_text}
 
-Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question. Consider:
-- The individual responses and their insights
-- The peer rankings and what they reveal about response quality
-- Any patterns of agreement or disagreement
+AGGREGATE PEER RANKINGS (lower average_rank = rated higher by peers):
+{aggregate_text}
 
-Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
+YOUR TASK — produce a structured synthesis:
+
+1. CONSENSUS: Identify the key points where most responses agree.
+2. DISAGREEMENTS & UNIQUE INSIGHTS: Note any meaningful differences or valuable unique contributions from individual responses.
+3. FINAL ANSWER: Produce a single, authoritative answer that:
+   - Weights higher-ranked responses proportionally (those with lower average_rank numbers were rated more highly by peers)
+   - Integrates consensus points and the strongest unique insights
+   - Resolves contradictions in favor of higher-ranked responses
+
+STRICT RULES:
+- Do NOT copy any single response verbatim. Synthesize across all of them.
+- Do NOT begin with praise or meta-commentary. Start directly with the answer.
+- Do NOT write phrases like "As the chairman...", "After reviewing...", "The council has determined...", "Based on the responses...", or any similar preamble.
+- Output clean markdown only. No labels, no internal ranking metadata, no mention of "Response A" etc.
+- The user should read your output as a direct, standalone answer to their question.
+
+Write the final synthesized answer now:"""
 
     messages = [{"role": "user", "content": chairman_prompt}]
 
-    # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    # Query the chairman model with retry (try twice on failure)
+    response = await query_model_routed(chairman_config, messages, timeout=30.0)
+    if response is None:
+        response = await query_model_routed(chairman_config, messages, timeout=30.0)
+
+    top_ranked_model = None
+    top_ranked_avg = None
+    if aggregate_rankings:
+        top_ranked_model = aggregate_rankings[0].get("model")
+        top_ranked_avg = aggregate_rankings[0].get("average_rank")
 
     if response is None:
-        # Fallback if chairman fails
+        # Fallback if chairman fails: return the best available Stage 1 answer
+        best_model = None
+        if aggregate_rankings:
+            best_model = aggregate_rankings[0].get("model")
+
+        best_stage1 = None
+        if best_model:
+            for result in stage1_results:
+                if result.get("model") == best_model:
+                    best_stage1 = result
+                    break
+
+        if best_stage1 is None and stage1_results:
+            best_stage1 = stage1_results[0]
+
+        if best_stage1 is not None:
+            return {
+                "model": f"fallback/{best_stage1.get('model', 'unknown')}",
+                "response": best_stage1.get("response", ""),
+                "selected_model": best_stage1.get("model"),
+                "selected_average_rank": top_ranked_avg,
+            }
+
         return {
-            "model": CHAIRMAN_MODEL,
+            "model": chairman_model_id,
             "response": "Error: Unable to generate final synthesis."
         }
 
     return {
-        "model": CHAIRMAN_MODEL,
-        "response": response.get('content', '')
+        "model": chairman_model_id,
+        "response": response.get('content', ''),
+        "selected_model": top_ranked_model,
+        "selected_average_rank": top_ranked_avg,
     }
 
 
@@ -178,39 +343,83 @@ def parse_ranking_from_text(ranking_text: str) -> List[str]:
     """
     Parse the FINAL RANKING section from the model's response.
 
+    Handles:
+        - Markdown code fences wrapping the ranking (```...```)
+        - Multiple numbering formats: "1. Response A", "1) Response A",
+          "1 - Response A", "Response A - 1st", bare "Response A"
+        - Conversational filler before/after the "FINAL RANKING:" section
+        - Duplicate entries (deduplicates while preserving order)
+
     Args:
         ranking_text: The full text response from the model
 
     Returns:
         List of response labels in ranked order
     """
-    import re
 
-    # Look for "FINAL RANKING:" section
-    if "FINAL RANKING:" in ranking_text:
-        # Extract everything after "FINAL RANKING:"
-        parts = ranking_text.split("FINAL RANKING:")
-        if len(parts) >= 2:
-            ranking_section = parts[1]
-            # Try to extract numbered list format (e.g., "1. Response A")
-            # This pattern looks for: number, period, optional space, "Response X"
-            numbered_matches = re.findall(r'\d+\.\s*Response [A-Z]', ranking_section)
-            if numbered_matches:
-                # Extract just the "Response X" part
-                return [re.search(r'Response [A-Z]', m).group() for m in numbered_matches]
+    def _unique_in_order(items: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
 
-            # Fallback: Extract all "Response X" patterns in order
-            matches = re.findall(r'Response [A-Z]', ranking_section)
-            return matches
+    def _strip_code_fences(text: str) -> str:
+        """Remove markdown code fences (``` ... ```) from text."""
+        return re.sub(r'```[a-zA-Z]*\n?', '', text).strip()
 
-    # Fallback: try to find any "Response X" patterns in order
-    matches = re.findall(r'Response [A-Z]', ranking_text)
-    return matches
+    def _extract_rankings_from_section(section: str) -> List[str]:
+        """Try multiple formats to extract Response labels from a section."""
+        section = _strip_code_fences(section)
+
+        # Format 1: "1. Response A" (strict numbered list)
+        matches = re.findall(r'\d+\.\s*(Response [A-Z])', section)
+        if matches:
+            return _unique_in_order(matches)
+
+        # Format 2: "1) Response A"
+        matches = re.findall(r'\d+\)\s*(Response [A-Z])', section)
+        if matches:
+            return _unique_in_order(matches)
+
+        # Format 3: "1 - Response A"
+        matches = re.findall(r'\d+\s*-\s*(Response [A-Z])', section)
+        if matches:
+            return _unique_in_order(matches)
+
+        # Format 4: "Response A - 1st" / "Response A - 2nd" etc.
+        matches = re.findall(r'(Response [A-Z])\s*-\s*\d+(?:st|nd|rd|th)?', section)
+        if matches:
+            return _unique_in_order(matches)
+
+        # Format 5: Bare "Response X" on its own line or in text
+        matches = re.findall(r'Response [A-Z]', section)
+        if matches:
+            return _unique_in_order(matches)
+
+        return []
+
+    # ── Primary: look for "FINAL RANKING:" section and IGNORE everything outside ──
+    # Case-insensitive match for "FINAL RANKING:"
+    ranking_match = re.search(r'FINAL\s+RANKING\s*:', ranking_text, re.IGNORECASE)
+    if ranking_match:
+        ranking_section = ranking_text[ranking_match.end():]
+        result = _extract_rankings_from_section(ranking_section)
+        if result:
+            return result
+
+    # ── Last resort: no FINAL RANKING section found ──
+    # Strip code fences from entire text and try to find any Response labels
+    cleaned = _strip_code_fences(ranking_text)
+    matches = re.findall(r'Response [A-Z]', cleaned)
+    return _unique_in_order(matches)
 
 
 def calculate_aggregate_rankings(
     stage2_results: List[Dict[str, Any]],
-    label_to_model: Dict[str, str]
+    label_to_model: Dict[str, str],
 ) -> List[Dict[str, Any]]:
     """
     Calculate aggregate rankings across all models.
@@ -227,15 +436,30 @@ def calculate_aggregate_rankings(
     # Track positions for each model
     model_positions = defaultdict(list)
 
+    max_labels = len(label_to_model)
+
     for ranking in stage2_results:
-        ranking_text = ranking['ranking']
+        evaluator_model = ranking.get('model')
+        parsed_ranking = ranking.get('parsed_ranking') or parse_ranking_from_text(ranking['ranking'])
 
-        # Parse the ranking from the structured format
-        parsed_ranking = parse_ranking_from_text(ranking_text)
+        # Safety guard: de-duplicate and cap list length so malformed model
+        # output cannot inflate vote counts.
+        deduped: List[str] = []
+        seen = set()
+        for label in parsed_ranking:
+            if label in seen:
+                continue
+            seen.add(label)
+            deduped.append(label)
+            if len(deduped) >= max_labels:
+                break
 
-        for position, label in enumerate(parsed_ranking, start=1):
+        for position, label in enumerate(deduped, start=1):
             if label in label_to_model:
                 model_name = label_to_model[label]
+                # Ignore a model's vote for itself to reduce self-recognition bias.
+                if evaluator_model == model_name:
+                    continue
                 model_positions[model_name].append(position)
 
     # Calculate average position for each model
@@ -274,7 +498,7 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
+    # Use gemini-2.5-flash for title generation (fast and cheap) via legacy string API
     response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
 
     if response is None:
@@ -323,7 +547,8 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     stage3_result = await stage3_synthesize_final(
         user_query,
         stage1_results,
-        stage2_results
+        stage2_results,
+        aggregate_rankings,
     )
 
     # Prepare metadata

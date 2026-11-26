@@ -48,14 +48,16 @@ Edit `backend/config.py` to customize the council:
 
 ```python
 COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "google/gemma-3-27b-it:free",
+  "qwen/qwen3-32b:free",
+  "deepseek/deepseek-r1-0528:free",
 ]
 
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+CHAIRMAN_MODEL = "google/gemma-3-27b-it:free"
 ```
+
+You can also define these in `council_config.json` or `config.yaml`.
 
 ## Running the Application
 
@@ -78,6 +80,128 @@ npm run dev
 ```
 
 Then open http://localhost:5173 in your browser.
+
+## Custom API Keys (Optional)
+
+By default every model call goes through OpenRouter.  If you have accounts
+with individual providers you can supply their keys directly — the app will
+call that provider's native API and skip OpenRouter entirely for those models.
+
+### Supported providers
+
+| Provider  | Env variable        | SDK package            | Model prefix examples              |
+|-----------|---------------------|------------------------|------------------------------------|
+| OpenAI    | `OPENAI_API_KEY`    | `openai`               | `openai/gpt-4o`, `openai/gpt-5.1` |
+| Anthropic | `ANTHROPIC_API_KEY` | `anthropic`            | `anthropic/claude-3-5-sonnet`      |
+| Google    | `GOOGLE_API_KEY`    | `google-generativeai`  | `google/gemini-1.5-pro`            |
+| Groq      | `GROQ_API_KEY`      | `groq`                 | `groq/llama-3.3-70b-versatile`     |
+
+Any provider **not** listed above (e.g. `x-ai/grok-4`, `mistralai/...`) will
+always route through OpenRouter regardless of what keys are set.
+
+### Key precedence
+
+Provider keys are resolved in this order:
+
+1. CLI flags
+2. Config file (`council_config.json` or `config.yaml`)
+3. Environment variables (`.env`)
+
+### How to enable
+
+1. Add the key(s) to your `.env` file (see `.env.example` for all options):
+
+```bash
+# Keep this for providers you haven't set up directly, and as a fallback
+OPENROUTER_API_KEY=sk-or-v1-...
+
+# Add whichever provider keys you have
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_API_KEY=AIza...
+GROQ_API_KEY=gsk_...
+```
+
+2. Install the corresponding SDK(s):
+
+```bash
+uv add openai               # for OpenAI direct calls
+uv add anthropic            # for Anthropic direct calls
+uv add google-generativeai  # for Google direct calls
+uv add groq                 # for Groq direct calls
+```
+
+3. (Optional) Provide keys and model overrides via config file:
+
+`council_config.json` example:
+
+```json
+{
+  "providers": {
+    "openai": { "api_key": "sk-..." },
+    "anthropic": { "api_key": "sk-ant-..." },
+    "google": { "api_key": "AIza..." },
+    "groq": { "api_key": "gsk_..." },
+    "openrouter": { "api_key": "sk-or-v1-..." },
+    "fallback_to_openrouter": true
+  },
+  "openrouter": {
+    "free_models_only": true
+  },
+  "council_models": [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
+    "qwen/qwen3-32b:free"
+  ],
+  "chairman_model": "google/gemma-3-27b-it:free"
+}
+```
+
+4. (Optional) Override from CLI when launching backend:
+
+```bash
+uv run python -m backend.main \
+  --config ./council_config.json \
+  --openai-key sk-... \
+  --google-key AIza... \
+  --groq-key gsk_... \
+  --provider-fallback-to-openrouter true
+```
+
+   If a key is set but the SDK is not installed, the call will fail with a
+   clear error message (and fall back to OpenRouter if
+   `PROVIDER_FALLBACK_TO_OPENROUTER` is not disabled).
+
+### Fallback behaviour
+
+- If a direct provider call **succeeds** → the response is returned immediately.
+- If it **fails** (bad key, quota exceeded, network error, etc.) → a warning is
+  logged to the console and the request is automatically retried via OpenRouter.
+- To disable the fallback and surface the error instead:
+
+```bash
+PROVIDER_FALLBACK_TO_OPENROUTER=false
+```
+
+### OpenRouter free-only mode
+
+By default OpenRouter requests are constrained to free models only. If a
+non-free model id is selected for an OpenRouter-routed call, the backend logs
+a warning and swaps it to a fallback `:free` model.
+
+To disable this policy:
+
+```bash
+OPENROUTER_FREE_MODELS_ONLY=false
+```
+
+### Routing logic
+
+All routing lives in `backend/llm_client.py`.  The provider is inferred from
+the model name prefix (`openai/…` → OpenAI, `anthropic/…` → Anthropic,
+`google/…` → Google, `groq/…` → Groq).  The function
+`infer_provider(model_name)` can be called
+directly if you want to verify how a particular model string will be routed.
 
 ## Tech Stack
 

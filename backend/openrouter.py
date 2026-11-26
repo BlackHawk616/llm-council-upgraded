@@ -1,79 +1,16 @@
-"""OpenRouter API client for making LLM requests."""
+"""OpenRouter API client — public interface preserved for backward compatibility.
 
-import httpx
-from typing import List, Dict, Any, Optional
-from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
+All routing logic now lives in llm_client.py.  This module re-exports the
+functions that the rest of the codebase imports so that no other file needs to
+change.
+"""
 
+from typing import Any, Dict, List, Optional
 
-async def query_model(
-    model: str,
-    messages: List[Dict[str, str]],
-    timeout: float = 120.0
-) -> Optional[Dict[str, Any]]:
-    """
-    Query a single model via OpenRouter API.
+# Re-export the unified routing functions under their original names.
+# query_model() will use a direct provider key when available and fall back to
+# OpenRouter otherwise.  query_models_parallel() runs them concurrently.
+# query_model_routed() is the new dict-based entry point.
+from .llm_client import query_model, query_models_parallel, query_model_routed
 
-    Args:
-        model: OpenRouter model identifier (e.g., "openai/gpt-4o")
-        messages: List of message dicts with 'role' and 'content'
-        timeout: Request timeout in seconds
-
-    Returns:
-        Response dict with 'content' and optional 'reasoning_details', or None if failed
-    """
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": model,
-        "messages": messages,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                OPENROUTER_API_URL,
-                headers=headers,
-                json=payload
-            )
-            response.raise_for_status()
-
-            data = response.json()
-            message = data['choices'][0]['message']
-
-            return {
-                'content': message.get('content'),
-                'reasoning_details': message.get('reasoning_details')
-            }
-
-    except Exception as e:
-        print(f"Error querying model {model}: {e}")
-        return None
-
-
-async def query_models_parallel(
-    models: List[str],
-    messages: List[Dict[str, str]]
-) -> Dict[str, Optional[Dict[str, Any]]]:
-    """
-    Query multiple models in parallel.
-
-    Args:
-        models: List of OpenRouter model identifiers
-        messages: List of message dicts to send to each model
-
-    Returns:
-        Dict mapping model identifier to response dict (or None if failed)
-    """
-    import asyncio
-
-    # Create tasks for all models
-    tasks = [query_model(model, messages) for model in models]
-
-    # Wait for all to complete
-    responses = await asyncio.gather(*tasks)
-
-    # Map models to their responses
-    return {model: response for model, response in zip(models, responses)}
+__all__ = ["query_model", "query_models_parallel", "query_model_routed"]
