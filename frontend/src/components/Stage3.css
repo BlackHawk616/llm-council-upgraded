@@ -3,6 +3,13 @@
   border-color: #c8e6c8;
 }
 
+.stage3-description {
+  margin: 0 0 12px 0;
+  color: #3f6b3f;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .final-response {
   background: #ffffff;
   padding: 20px;
@@ -12,6 +19,14 @@
 
 .chairman-label {
   color: #2d8a2d;
+  font-size: 12px;
+  font-family: monospace;
+  margin-bottom: 12px;
+  font-weight: 600;
+}
+
+.selected-model-label {
+  color: #1e5f99;
   font-size: 12px;
   font-family: monospace;
   margin-bottom: 12px;

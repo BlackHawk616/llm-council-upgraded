@@ -16,6 +16,13 @@ function deAnonymizeText(text, labelToModel) {
 
 export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
   const [activeTab, setActiveTab] = useState(0);
+  const expectedVotesPerModel = Math.max(rankings.length - 1, 0);
+  const hasVoteCountOverflow =
+    aggregateRankings &&
+    aggregateRankings.some((agg) => agg.rankings_count > expectedVotesPerModel);
+  const hasIncompleteVotes =
+    aggregateRankings &&
+    aggregateRankings.some((agg) => agg.rankings_count < expectedVotesPerModel);
 
   if (!rankings || rankings.length === 0) {
     return null;
@@ -74,8 +81,20 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
         <div className="aggregate-rankings">
           <h4>Aggregate Rankings (Street Cred)</h4>
           <p className="stage-description">
-            Combined results across all peer evaluations (lower score is better):
+            Combined results across all peer evaluations (lower score is better). Self-votes are excluded.
           </p>
+          {hasVoteCountOverflow && (
+            <p className="stage2-warning">
+              Vote-count mismatch detected. With {rankings.length} evaluators and self-vote exclusion,
+              each model should have at most {expectedVotesPerModel} votes. This usually means stale
+              conversation data from before the latest ranking fix.
+            </p>
+          )}
+          {!hasVoteCountOverflow && hasIncompleteVotes && (
+            <p className="stage2-warning">
+              Some rankings were incomplete or parsing failed, so vote counts are lower than expected.
+            </p>
+          )}
           <div className="aggregate-list">
             {aggregateRankings.map((agg, index) => (
               <div key={index} className="aggregate-item">
